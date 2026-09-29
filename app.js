@@ -2,10 +2,10 @@
   "use strict";
 
   const STORAGE_KEY = "baseball_handicap_pwa_shared_v02_cache";
-  const VERSION = 2;
+  const VERSION = 5;
   // POSと同じFirebase Realtime Databaseを利用し、野球アプリ専用パスへ分離。
-  const FIREBASE_DATABASE_URL = "https://blow2nd-73e80-default-rtdb.asia-southeast1.firebasedatabase.app";
-  const CLOUD_ROOT = "baseball_handicap_shared_v1";
+  const FIREBASE_DATABASE_URL = "https://blow-pos-default-rtdb.asia-southeast1.firebasedatabase.app";
+  const CLOUD_ROOT = "blow2nd/baseball_handicap";
 
   const BASE_TEAMS = {
     "セ・リーグ": ["阪神タイガース","横浜DeNAベイスターズ","読売ジャイアンツ","中日ドラゴンズ","広島東洋カープ","東京ヤクルトスワローズ"],
@@ -14,58 +14,89 @@
     "ナ・リーグ": ["アトランタ・ブレーブス","マイアミ・マーリンズ","ニューヨーク・メッツ","フィラデルフィア・フィリーズ","ワシントン・ナショナルズ","シカゴ・カブス","シンシナティ・レッズ","ミルウォーキー・ブルワーズ","ピッツバーグ・パイレーツ","セントルイス・カージナルス","アリゾナ・ダイヤモンドバックス","コロラド・ロッキーズ","ロサンゼルス・ドジャース","サンディエゴ・パドレス","サンフランシスコ・ジャイアンツ"]
   };
 
-  // 重要: 1.5 と 1半 は別ID。数値へ潰さない。
-  const HANDICAPS = [
-    {id:"0.3", label:"0.3"},
-    {id:"0.5", label:"0.5"},
-    {id:"0.7", label:"0.7"},
-    {id:"1", label:"1"},
-    {id:"1.3", label:"1.3"},
-    {id:"1.5", label:"1.5"},
-    {id:"1.7", label:"1.7"},
-    {id:"1H", label:"1半"},
-    {id:"1H3", label:"1半3"},
-    {id:"1H5", label:"1半5"},
-    {id:"1H7", label:"1半7"},
-    {id:"2", label:"2"}
+  // ハンデは打ち込み式。数値ハンデは0.1刻みで4.0まで対応。
+  // 「1.5」と「1半」は別ルール。半系は 1半〜3半9 まで対応する。
+  // 旧版の 1H / 1H3 形式も読み込み時に互換変換する。
+  const HANDICAP_SUGGESTIONS = [
+    ...Array.from({length:40}, (_,i)=>{
+      const n=(i+1)/10;
+      return Number.isInteger(n) ? String(n) : n.toFixed(1);
+    }),
+    ...[1,2,3].flatMap(base => [
+      `${base}半`,
+      ...Array.from({length:9}, (_,i)=>`${base}半${i+1}`)
+    ])
   ];
 
-  const RULE_TEXT = {
-    "0.3":["3分負け","7分勝ち","丸勝ち","丸勝ち"],
-    "0.5":["5分負け","5分勝ち","丸勝ち","丸勝ち"],
-    "0.7":["7分負け","3分勝ち","丸勝ち","丸勝ち"],
-    "1":["丸負け","勝負無し","丸勝ち","丸勝ち"],
-    "1.3":["丸負け","3分負け","丸勝ち","丸勝ち"],
-    "1.5":["丸負け","5分負け","丸勝ち","丸勝ち"],
-    "1.7":["丸負け","7分負け","丸勝ち","丸勝ち"],
-    "1H":["丸負け","丸負け","丸勝ち","丸勝ち"],
-    "1H3":["丸負け","丸負け","7分勝ち","丸勝ち"],
-    "1H5":["丸負け","丸負け","5分勝ち","丸勝ち"],
-    "1H7":["丸負け","丸負け","3分勝ち","丸勝ち"],
-    "2":["丸負け","丸負け","勝負無し","丸勝ち"]
-  };
+  function normalizeHandicapInput(raw) {
+    let v = String(raw ?? "").trim()
+      .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+      .replace(/[．。・]/g, ".")
+      .replace(/\s+/g, "")
+      .replace(/^([1-3])[hH](\d?)$/, (_,base,d)=>`${base}半${d||""}`);
+    if (!v) return "";
+
+    const half = v.match(/^([1-3])半([1-9])?$/);
+    if (half) return `${half[1]}半${half[2] || ""}`;
+
+    if (!/^\d+(?:\.\d+)?$/.test(v)) return "";
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > 4) return "";
+    const tenth = Math.round(n * 10) / 10;
+    if (Math.abs(n - tenth) > 1e-9) return ""; // 0.1刻みのみ
+    if (tenth === 0) return "0";
+    if (Number.isInteger(tenth)) return String(tenth);
+    return tenth.toFixed(1);
+  }
 
   function giverMultiplier(handicapId, margin) {
     if (margin < 0) return -1;
-    const table = {
-      "0.3": {0:-0.3,1:0.7,2:1},
-      "0.5": {0:-0.5,1:0.5,2:1},
-      "0.7": {0:-0.7,1:0.3,2:1},
-      "1":   {0:-1,1:0,2:1},
-      "1.3": {0:-1,1:-0.3,2:1},
-      "1.5": {0:-1,1:-0.5,2:1},
-      "1.7": {0:-1,1:-0.7,2:1},
-      "1H":  {0:-1,1:-1,2:1},
-      "1H3": {0:-1,1:-1,2:0.7,3:1},
-      "1H5": {0:-1,1:-1,2:0.5,3:1},
-      "1H7": {0:-1,1:-1,2:0.3,3:1},
-      "2":   {0:-1,1:-1,2:0,3:1}
-    }[handicapId];
-    if (!table) throw new Error("未対応ハンデ");
-    if (Object.prototype.hasOwnProperty.call(table, margin)) return table[margin];
-    const keys = Object.keys(table).map(Number).sort((a,b)=>b-a);
-    for (const k of keys) if (margin >= k) return table[k];
-    return -1;
+    const h = normalizeHandicapInput(handicapId);
+    if (!h) throw new Error("未対応ハンデ");
+
+    // n半 / n半1〜n半9
+    // 例: 2半 → 2点差までは丸負け、3点差で丸勝ち。
+    //     2半3 → 2点差までは丸負け、3点差で7分勝ち、4点差以上で丸勝ち。
+    const half = h.match(/^([1-3])半([1-9])?$/);
+    if (half) {
+      const base = Number(half[1]);
+      const suffix = half[2] ? Number(half[2]) : null;
+      if (margin <= base) return -1;
+      if (suffix === null) return 1; // base+1点差以上
+      if (margin === base + 1) return (10 - suffix) / 10;
+      return 1; // base+2点差以上
+    }
+
+    const n = Number(h);
+    const base = Math.floor(n + 1e-9);
+    const frac = Math.round((n - base) * 10) / 10;
+
+    // 整数ハンデ: 例 4 → 3点差以下=丸負け / 4点差=勝負無し / 5点差以上=丸勝ち
+    if (frac === 0) {
+      if (margin < base) return -1;
+      if (margin === base) return 0;
+      return 1;
+    }
+
+    // 0.xだけは元表どおり、1点差勝ちで残り割合が勝ちになる。
+    // 例 0.3 → 引分3分負け / 1点差7分勝ち / 2点差以上丸勝ち
+    if (base === 0) {
+      if (margin === 0) return -frac;
+      if (margin === 1) return 1 - frac;
+      return 1;
+    }
+
+    // 1.1〜3.9: 整数部分の点差までは負け側、次の1点で丸勝ち。
+    // 例 2.3 → 1点差以下丸負け / 2点差3分負け / 3点差以上丸勝ち
+    if (margin < base) return -1;
+    if (margin === base) return -frac;
+    return 1;
+  }
+
+  function handicapRuleRow(handicapId, maxMargin=5) {
+    const h = normalizeHandicapInput(handicapId);
+    if (!h) return null;
+    return Array.from({length:maxMargin+1}, (_,m)=>outcomeLabel(giverMultiplier(h, m)));
   }
 
   function outcomeLabel(mult) {
@@ -155,13 +186,16 @@
   }
 
   async function cloudRequest(method, path="", body=undefined) {
-    const options = {method, headers:{"Content-Type":"application/json"}, cache:"no-store"};
-    if (body !== undefined) options.body = JSON.stringify(body);
+    const options = {method, cache:"no-store"};
+    if (body !== undefined) {
+      options.headers = {"Content-Type":"application/json"};
+      options.body = JSON.stringify(body);
+    }
     const res = await fetch(cloudUrl(path), options);
-    if (!res.ok) throw new Error(`Firebase ${res.status}`);
-    if (res.status === 204) return null;
     const txt = await res.text();
-    return txt ? JSON.parse(txt) : null;
+    if (!res.ok) throw new Error(`HTTP ${res.status}${txt ? " " + txt : ""}`);
+    if (res.status === 204 || !txt) return null;
+    return JSON.parse(txt);
   }
 
   async function refreshFromCloud({silent=false}={}) {
@@ -175,7 +209,8 @@
       if (!silent) toast("共通データに接続しました");
     } catch (err) {
       cloudReady = false;
-      setSyncStatus("offline", navigator.onLine ? "共通データ接続エラー" : "オフライン");
+      const detail = err?.message || String(err);
+      setSyncStatus("offline", navigator.onLine ? `共通データ読込エラー: ${detail}` : "オフライン");
       if (!silent) toast("共通データへ接続できません");
       console.error(err);
     }
@@ -186,17 +221,12 @@
     syncTimer = setTimeout(() => refreshFromCloud({silent:true}), 120);
   }
 
-  function startCloudStream() {
-    if (!("EventSource" in window)) return;
-    try {
-      const es = new EventSource(cloudUrl());
-      es.addEventListener("put", scheduleCloudRefresh);
-      es.addEventListener("patch", scheduleCloudRefresh);
-      es.onopen = () => setSyncStatus("online", "全員共通・同期中");
-      es.onerror = () => setSyncStatus(navigator.onLine ? "connecting" : "offline", navigator.onLine ? "再接続中…" : "オフライン");
-    } catch (err) {
-      console.error(err);
-    }
+  let cloudPollTimer = null;
+  function startCloudPolling() {
+    clearInterval(cloudPollTimer);
+    cloudPollTimer = setInterval(() => {
+      if (navigator.onLine) refreshFromCloud({silent:true});
+    }, 2500);
   }
 
   async function writeCloud(method, path, body, successText) {
@@ -226,7 +256,7 @@
   }
 
   function hcapLabel(id) {
-    return HANDICAPS.find(h => h.id === id)?.label || id;
+    return normalizeHandicapInput(id) || String(id || "");
   }
 
   function teamsFor(league) {
@@ -372,13 +402,14 @@
             <select name="giver" id="giverSelect" required></select>
           </div>
           <div>
-            <label>ハンデ</label>
-            <select name="handicap" required>
-              ${HANDICAPS.map(h=>`<option value="${h.id}">${h.label}</option>`).join("")}
-            </select>
+            <label>ハンデ（打ち込み）</label>
+            <input name="handicap" id="handicapInput" list="handicapSuggestions" inputmode="decimal" autocomplete="off" placeholder="例: 0.1 / 2.3 / 3.7 / 4.0 / 2半3" required>
+            <datalist id="handicapSuggestions">
+              ${HANDICAP_SUGGESTIONS.map(h=>`<option value="${h}"></option>`).join("")}
+            </datalist>
           </div>
         </div>
-        <div class="note" style="margin:14px 0">「1.5」と「1半」は別ルールとして保存・計算します。</div>
+        <div id="handicapPreview" class="note" style="margin:14px 0">0.1〜4.0を0.1刻みで直接入力できます。「1.5」と「1半」は別ルールです。</div>
         <button class="primary-btn full" type="submit">試合を登録</button>
       </form>
     `;
@@ -462,16 +493,16 @@
       <div class="section-title"><div><h2>設定</h2><div class="muted small">ルール・チーム・バックアップ</div></div></div>
 
       <div class="card">
-        <div class="section-title"><h3>ハンデ計算マスター</h3><span class="badge">固定</span></div>
+        <div class="section-title"><h3>ハンデ計算マスター</h3><span class="badge">0.1刻み</span></div>
         <div class="table-wrap">
           <table class="rule-table">
-            <thead><tr><th>出し</th><th>引分</th><th>1点差勝ち</th><th>2点差勝ち</th><th>3点差勝ち</th></tr></thead>
+            <thead><tr><th>出し</th><th>引分</th><th>1点差勝ち</th><th>2点差勝ち</th><th>3点差勝ち</th><th>4点差勝ち</th><th>5点差勝ち</th></tr></thead>
             <tbody>
-              ${HANDICAPS.map(h=>`<tr><th>${h.label}</th>${RULE_TEXT[h.id].map(x=>`<td>${x}</td>`).join("")}</tr>`).join("")}
+              ${HANDICAP_SUGGESTIONS.map(h=>`<tr><th>${h}</th>${handicapRuleRow(h).map(x=>`<td>${x}</td>`).join("")}</tr>`).join("")}
             </tbody>
           </table>
         </div>
-        <p class="muted small">ハンデを出しているチーム側から見た判定。相手側に賭けた場合は勝敗率を反転します。</p>
+        <p class="muted small">ハンデを出しているチーム側から見た判定。相手側に賭けた場合は勝敗率を反転します。数値は0.1〜4.0を0.1刻みで対応。半系は1半〜3半9に対応。</p>
       </div>
 
       <div class="card">
@@ -532,6 +563,22 @@
       updateTeams();
     }
 
+    const handicapInput = document.getElementById("handicapInput");
+    const handicapPreview = document.getElementById("handicapPreview");
+    if (handicapInput && handicapPreview) {
+      const updateHandicapPreview = () => {
+        const h = normalizeHandicapInput(handicapInput.value);
+        if (!h) {
+          handicapPreview.textContent = "入力例: 0.1 / 2.3 / 3.7 / 4.0 / 2半3（0.1刻み）";
+          return;
+        }
+        const r = handicapRuleRow(h, 5);
+        handicapPreview.innerHTML = `<b>${esc(h)}</b>：引分 ${esc(r[0])} / 1点差 ${esc(r[1])} / 2点差 ${esc(r[2])} / 3点差 ${esc(r[3])} / 4点差 ${esc(r[4])} / 5点差 ${esc(r[5])}`;
+      };
+      handicapInput.addEventListener("input", updateHandicapPreview);
+      updateHandicapPreview();
+    }
+
     const newForm = document.getElementById("newGameForm");
     if (newForm) newForm.onsubmit = async e => {
       e.preventDefault();
@@ -540,6 +587,8 @@
       if (teamA === teamB) return toast("同じチーム同士は登録できません");
       const giver = fd.get("giver");
       if (![teamA,teamB].includes(giver)) return toast("ハンデ出しチームを確認してください");
+      const handicap = normalizeHandicapInput(fd.get("handicap"));
+      if (!handicap) return toast("ハンデは0.1〜4.0の0.1刻み、または1半〜3半系で入力してください");
       const game = {
         id:uid("game"),
         createdAt:Date.now(),
@@ -547,7 +596,7 @@
         league:fd.get("league"),
         teamA, teamB,
         handicapGiver:giver,
-        handicapId:fd.get("handicap"),
+        handicapId:handicap,
         bets:[],
         scoreA:null, scoreB:null
       };
@@ -715,5 +764,5 @@
   window.addEventListener("offline",()=>setSyncStatus("offline","オフライン"));
   render();
   refreshFromCloud();
-  startCloudStream();
+  startCloudPolling();
 })();
