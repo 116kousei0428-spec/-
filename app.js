@@ -121,6 +121,20 @@
   let deferredPrompt = null;
   let syncTimer = null;
   let cloudReady = false;
+  let editingDirty = false;
+  let cloudWriteInFlight = 0;
+
+  function isEditableElement(el) {
+    return !!el && (
+      el.matches?.("input, textarea, select") ||
+      el.isContentEditable
+    );
+  }
+
+  function shouldDeferCloudRender() {
+    const modal = document.getElementById("modal");
+    return cloudWriteInFlight > 0 || editingDirty || isEditableElement(document.activeElement) || !!modal?.open;
+  }
 
   function loadCache() {
     try {
@@ -201,10 +215,19 @@
   async function refreshFromCloud({silent=false}={}) {
     try {
       const remote = await cloudRequest("GET");
+      cloudReady = true;
+      setSyncStatus("online", shouldDeferCloudRender() ? "全員共通・入力中" : "全員共通・同期中");
+
+      // 入力中に app.innerHTML を作り直すと、未保存の文字が消える。
+      // Firebase の取得自体は続けるが、フォーム編集中は state / DOM へ反映しない。
+      // 入力確定・画面遷移後の次回ポーリングで最新状態を反映する。
+      if (shouldDeferCloudRender()) {
+        if (!silent) toast("共通データに接続しました");
+        return;
+      }
+
       state = normalizeState(remote || {});
       saveCache();
-      cloudReady = true;
-      setSyncStatus("online", "全員共通・同期中");
       render();
       if (!silent) toast("共通データに接続しました");
     } catch (err) {
@@ -230,19 +253,23 @@
   }
 
   async function writeCloud(method, path, body, successText) {
+    cloudWriteInFlight++;
     try {
       setSyncStatus("connecting", "保存中…");
       await cloudRequest(method, path, body);
       saveCache();
       setSyncStatus("online", "全員共通・同期中");
       if (successText) toast(successText);
+      scheduleCloudRefresh();
       return true;
     } catch (err) {
       console.error(err);
       setSyncStatus("offline", "クラウド保存エラー");
       toast("保存に失敗しました。通信を確認してください");
-      await refreshFromCloud({silent:true});
       return false;
+    } finally {
+      cloudWriteInFlight = Math.max(0, cloudWriteInFlight - 1);
+      if (!cloudWriteInFlight && navigator.onLine) scheduleCloudRefresh();
     }
   }
 
@@ -298,6 +325,8 @@
   }
 
   function render() {
+    // render() はユーザー操作で入力が確定した時か、編集中でないクラウド同期時だけ呼ぶ。
+    editingDirty = false;
     document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.route === route));
     const app = document.getElementById("app");
     if (route === "today") app.innerHTML = renderToday();
@@ -751,7 +780,20 @@
     clearTimeout(toast._t);toast._t=setTimeout(()=>el.classList.remove("show"),1800);
   }
 
-  document.querySelectorAll(".nav-btn").forEach(b=>b.onclick=()=>{route=b.dataset.route;render();});
+  document.addEventListener("input", e => {
+    if (isEditableElement(e.target)) editingDirty = true;
+  }, true);
+  document.addEventListener("change", e => {
+    if (isEditableElement(e.target)) editingDirty = true;
+  }, true);
+
+  const modalRoot = document.getElementById("modal");
+  if (modalRoot) modalRoot.addEventListener("close", () => {
+    editingDirty = false;
+    if (navigator.onLine) scheduleCloudRefresh();
+  });
+
+  document.querySelectorAll(".nav-btn").forEach(b=>b.onclick=()=>{route=b.dataset.route;render(); if(navigator.onLine) scheduleCloudRefresh();});
 
   window.addEventListener("beforeinstallprompt", e=>{
     e.preventDefault();deferredPrompt=e;

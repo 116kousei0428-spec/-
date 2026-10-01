@@ -80,3 +80,9 @@ Realtime DatabaseのSecurity Rulesが、この野球アプリ専用パスへの�
 - `3.7`: 3点差勝ち=7分負け、4点差以上=丸勝ち
 - `4.0`: 4点差勝ち=勝負無し、5点差以上=丸勝ち
 - `2半3`: 2点差までは丸負け、3点差=7分勝ち、4点差以上=丸勝ち
+
+
+## v6 input-sync fix
+- Firebase polling no longer re-renders the app while an input/select/textarea or modal is being edited.
+- Prevents typed handicap/bettor/amount/score values from disappearing during the 2.5-second shared-data poll.
+- PWA cache key and app.js query version bumped to v6 so deployed clients receive the fix.
