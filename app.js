@@ -2,7 +2,7 @@
   "use strict";
 
   const STORAGE_KEY = "baseball_handicap_pwa_shared_v02_cache";
-  const VERSION = 5;
+  const VERSION = 7;
   // POSと同じFirebase Realtime Databaseを利用し、野球アプリ専用パスへ分離。
   const FIREBASE_DATABASE_URL = "https://blow-pos-default-rtdb.asia-southeast1.firebasedatabase.app";
   const CLOUD_ROOT = "blow2nd/baseball_handicap";
@@ -157,8 +157,23 @@
     const gamesRaw = raw.games || {};
     const games = (Array.isArray(gamesRaw) ? gamesRaw.filter(Boolean) : Object.values(gamesRaw)).map(g => {
       const betsRaw = g?.bets || {};
-      const bets = Array.isArray(betsRaw) ? betsRaw.filter(Boolean) : Object.values(betsRaw);
-      return {...g, bets};
+      const rawBets = Array.isArray(betsRaw) ? betsRaw.filter(Boolean) : Object.values(betsRaw);
+      const legacyFinal = g?.scoreA !== null && g?.scoreA !== "" && g?.scoreB !== null && g?.scoreB !== "";
+      const status = String(g?.status || (legacyFinal ? "FINAL" : "SCHEDULED")).toUpperCase();
+      const bets = rawBets.map(b => ({
+        ...b,
+        handicapGiver: b?.handicapGiver || g?.handicapGiver || b?.team || g?.teamA,
+        handicapId: normalizeHandicapInput(b?.handicapId || g?.handicapId || "0") || "0"
+      }));
+      return {
+        ...g,
+        externalGameId: g?.externalGameId || null,
+        status,
+        resultLocked: status === "FINAL",
+        scoreA: g?.scoreA ?? null,
+        scoreB: g?.scoreB ?? null,
+        bets
+      };
     }).filter(g => g && g.id);
 
     const customTeams = {...base.customTeams};
@@ -216,7 +231,7 @@
     try {
       const remote = await cloudRequest("GET");
       cloudReady = true;
-      setSyncStatus("online", shouldDeferCloudRender() ? "全員共通・入力中" : "全員共通・同期中");
+      setSyncStatus("online", shouldDeferCloudRender() ? "入力中" : "同期中");
 
       // 入力中に app.innerHTML を作り直すと、未保存の文字が消える。
       // Firebase の取得自体は続けるが、フォーム編集中は state / DOM へ反映しない。
@@ -258,7 +273,7 @@
       setSyncStatus("connecting", "保存中…");
       await cloudRequest(method, path, body);
       saveCache();
-      setSyncStatus("online", "全員共通・同期中");
+      setSyncStatus("online", "同期中");
       if (successText) toast(successText);
       scheduleCloudRefresh();
       return true;
@@ -304,24 +319,59 @@
     return String(v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   }
 
+  function isFinalGame(game) {
+    return String(game?.status || "").toUpperCase() === "FINAL";
+  }
+
+  function isVoidGame(game) {
+    return ["CANCELLED","POSTPONED","SUSPENDED","NO_GAME","VOID"].includes(String(game?.status || "").toUpperCase());
+  }
+
   function settleGame(game) {
+    // 途中経過では絶対に精算しない。FINAL の確定結果だけを対象にする。
+    if (!isFinalGame(game)) return null;
     if (game.scoreA === null || game.scoreB === null || game.scoreA === "" || game.scoreB === "") return null;
     const scoreA = Number(game.scoreA), scoreB = Number(game.scoreB);
-    const giverIsA = game.handicapGiver === game.teamA;
-    const giverScore = giverIsA ? scoreA : scoreB;
-    const recvScore = giverIsA ? scoreB : scoreA;
-    const margin = giverScore - recvScore;
-    const gm = giverMultiplier(game.handicapId, margin);
-    const bets = game.bets.map(b => {
-      const mult = b.team === game.handicapGiver ? gm : -gm;
-      const profit = Math.round(Number(b.amount) * mult);
-      return {...b, multiplier:mult, outcome:outcomeLabel(mult), profit};
+    if (!Number.isInteger(scoreA) || !Number.isInteger(scoreB) || scoreA < 0 || scoreB < 0) return null;
+
+    const bets = (game.bets || []).map(b => {
+      const giver = b.handicapGiver;
+      const h = normalizeHandicapInput(b.handicapId);
+      if (!h || ![game.teamA, game.teamB].includes(giver) || ![game.teamA, game.teamB].includes(b.team)) {
+        return {...b, multiplier:null, outcome:"要確認", profit:null, invalid:true};
+      }
+      const giverIsA = giver === game.teamA;
+      const giverScore = giverIsA ? scoreA : scoreB;
+      const recvScore = giverIsA ? scoreB : scoreA;
+      const margin = giverScore - recvScore;
+      const gm = giverMultiplier(h, margin);
+      const mult = b.team === giver ? gm : -gm;
+      const amount = Number(b.amount);
+      if (!Number.isFinite(amount) || amount <= 0) return {...b, multiplier:null, outcome:"要確認", profit:null, invalid:true};
+      const profit = Math.round(amount * mult);
+      return {...b, margin, multiplier:mult, outcome:outcomeLabel(mult), profit};
     });
-    return {margin, giverMultiplier:gm, giverOutcome:outcomeLabel(gm), bets};
+    return {bets};
   }
 
   function gameStatus(game) {
+    if (isVoidGame(game)) return "void";
     return settleGame(game) ? "settled" : "open";
+  }
+
+  function canonicalGameKey({date, league, teamA, teamB, externalGameId}) {
+    if (externalGameId) return `ext:${String(externalGameId)}`;
+    const pair = [String(teamA || "").trim(), String(teamB || "").trim()].sort().join("::");
+    return `manual:${date || ""}:${league || ""}:${pair}`;
+  }
+
+  function canAcceptBet(game) {
+    const status = String(game?.status || "SCHEDULED").toUpperCase();
+    if (["FINAL","CANCELLED","POSTPONED","SUSPENDED","NO_GAME","VOID"].includes(status)) return false;
+    if (!game?.startAt) return true;
+    const start = Date.parse(game.startAt);
+    if (!Number.isFinite(start)) return true;
+    return Date.now() < start - 10 * 60 * 1000;
   }
 
   function render() {
@@ -365,10 +415,10 @@
             <div class="inline-actions">
               <span class="badge">${esc(leagueGroup(game.league))}</span>
               <span class="badge">${esc(game.league)}</span>
-              <span class="badge ${status}">${settled ? "結果入力済" : "受付中"}</span>
+              <span class="badge ${status}">${isVoidGame(game) ? "中止/延期" : settled ? "結果確定" : canAcceptBet(game) ? "受付中" : "受付締切"}</span>
             </div>
             <div class="matchup" style="margin-top:9px">${esc(game.teamA)} <span class="muted">vs</span> ${esc(game.teamB)}</div>
-            <div class="hcap-line">ハンデ：<b>${esc(game.handicapGiver)}</b> が <b>${esc(hcapLabel(game.handicapId))}</b> 出し</div>
+            <div class="hcap-line">${game.externalGameId ? `試合ID: ${esc(game.externalGameId)}` : "手動試合"}</div>
           </div>
         </div>
 
@@ -378,7 +428,7 @@
             <span class="muted">-</span>
             <div><div class="score-team">${esc(game.teamB)}</div>${game.scoreB}</div>
           </div>
-          <div class="note">ハンデ出し側判定：${esc(settled.giverOutcome)}</div>
+          <div class="note">FINAL 確定結果のみ精算対象</div>
         ` : ""}
 
         <div class="divider"></div>
@@ -387,14 +437,14 @@
           const sb = settled?.bets.find(x=>x.id===b.id);
           return `<div class="bet-row">
             <strong>${esc(b.bettor)}</strong>
-            <span>${esc(b.team)}</span>
+            <span>${esc(b.team)} / ${esc(b.handicapGiver)} ${esc(hcapLabel(b.handicapId))}出し</span>
             <span class="money">¥${Number(b.amount).toLocaleString("ja-JP")}</span>
-            ${sb ? `<span class="${sb.profit>0?'positive':sb.profit<0?'negative':'zero'}">${esc(sb.outcome)} ${yen(sb.profit)}</span>` : `<button class="ghost-btn small" data-delete-bet="${b.id}" data-game="${game.id}">削除</button>`}
+            ${sb ? (sb.invalid ? `<span class="negative">要確認</span>` : `<span class="${sb.profit>0?'positive':sb.profit<0?'negative':'zero'}">${esc(sb.outcome)} ${yen(sb.profit)}</span>`) : `<button class="ghost-btn small" data-delete-bet="${b.id}" data-game="${game.id}">削除</button>`}
           </div>`;
         }).join("") : `<div class="muted small">まだ登録なし</div>`}
 
         <div class="inline-actions" style="margin-top:14px">
-          ${!settled ? `<button class="secondary-btn" data-add-bet="${game.id}">＋ 賭け</button>` : ""}
+          ${!settled && canAcceptBet(game) ? `<button class="secondary-btn" data-add-bet="${game.id}">＋ 賭け</button>` : ""}
           <button class="secondary-btn" data-result="${game.id}">${settled ? "結果を修正" : "結果入力"}</button>
           <button class="danger-btn" data-delete-game="${game.id}">試合削除</button>
         </div>
@@ -403,9 +453,8 @@
   }
 
   function renderNew() {
-    const defaultLeague = "セ・リーグ";
     return `
-      <div class="section-title"><div><h2>試合登録</h2><div class="muted small">リーグ → 対戦 → ハンデを登録</div></div></div>
+      <div class="section-title"><div><h2>試合登録</h2><div class="muted small">自動取得できない時の手動追加用</div></div></div>
       <form id="newGameForm" class="card">
         <div class="grid grid-2">
           <div>
@@ -426,19 +475,8 @@
             <label>チームB</label>
             <select name="teamB" id="teamB" required></select>
           </div>
-          <div>
-            <label>ハンデを出すチーム</label>
-            <select name="giver" id="giverSelect" required></select>
-          </div>
-          <div>
-            <label>ハンデ（打ち込み）</label>
-            <input name="handicap" id="handicapInput" list="handicapSuggestions" inputmode="decimal" autocomplete="off" placeholder="例: 0.1 / 2.3 / 3.7 / 4.0 / 2半3" required>
-            <datalist id="handicapSuggestions">
-              ${HANDICAP_SUGGESTIONS.map(h=>`<option value="${h}"></option>`).join("")}
-            </datalist>
-          </div>
         </div>
-        <div id="handicapPreview" class="note" style="margin:14px 0">0.1〜4.0を0.1刻みで直接入力できます。「1.5」と「1半」は別ルールです。</div>
+        <div class="note" style="margin:14px 0">同一日・同一リーグ・同一カードは二重登録できません。ハンデは賭け登録ごとに設定します。</div>
         <button class="primary-btn full" type="submit">試合を登録</button>
       </form>
     `;
@@ -471,6 +509,7 @@
         totalStake += Number(b.amount);
         const prev = map.get(b.bettor) || {stake:0, profit:0, bets:0};
         prev.stake += Number(b.amount);
+        if (b.invalid || b.profit === null) return;
         prev.profit += b.profit;
         prev.bets++;
         map.set(b.bettor, prev);
@@ -507,7 +546,7 @@
             <div>
               <div class="muted small">${esc(g.date)} / ${esc(g.league)}</div>
               <div class="matchup">${esc(g.teamA)} vs ${esc(g.teamB)}</div>
-              <div class="hcap-line">${esc(g.handicapGiver)} が ${esc(hcapLabel(g.handicapId))} 出し</div>
+              <div class="hcap-line">${g.externalGameId ? `試合ID: ${esc(g.externalGameId)}` : "手動試合"}</div>
             </div>
             <span class="badge ${gameStatus(g)}">${settleGame(g) ? `${g.scoreA}-${g.scoreB}` : "未結果"}</span>
           </div>
@@ -579,33 +618,9 @@
         const a = document.getElementById("teamA"), b = document.getElementById("teamB");
         a.innerHTML = list.map(t=>`<option>${esc(t)}</option>`).join("");
         b.innerHTML = list.map((t,i)=>`<option ${i===1?"selected":""}>${esc(t)}</option>`).join("");
-        updateGiver();
-      };
-      const updateGiver = () => {
-        const a = document.getElementById("teamA").value;
-        const b = document.getElementById("teamB").value;
-        document.getElementById("giverSelect").innerHTML = `<option>${esc(a)}</option><option>${esc(b)}</option>`;
       };
       league.onchange = updateTeams;
-      document.getElementById("teamA").onchange = updateGiver;
-      document.getElementById("teamB").onchange = updateGiver;
       updateTeams();
-    }
-
-    const handicapInput = document.getElementById("handicapInput");
-    const handicapPreview = document.getElementById("handicapPreview");
-    if (handicapInput && handicapPreview) {
-      const updateHandicapPreview = () => {
-        const h = normalizeHandicapInput(handicapInput.value);
-        if (!h) {
-          handicapPreview.textContent = "入力例: 0.1 / 2.3 / 3.7 / 4.0 / 2半3（0.1刻み）";
-          return;
-        }
-        const r = handicapRuleRow(h, 5);
-        handicapPreview.innerHTML = `<b>${esc(h)}</b>：引分 ${esc(r[0])} / 1点差 ${esc(r[1])} / 2点差 ${esc(r[2])} / 3点差 ${esc(r[3])} / 4点差 ${esc(r[4])} / 5点差 ${esc(r[5])}`;
-      };
-      handicapInput.addEventListener("input", updateHandicapPreview);
-      updateHandicapPreview();
     }
 
     const newForm = document.getElementById("newGameForm");
@@ -614,26 +629,25 @@
       const fd = new FormData(newForm);
       const teamA = fd.get("teamA"), teamB = fd.get("teamB");
       if (teamA === teamB) return toast("同じチーム同士は登録できません");
-      const giver = fd.get("giver");
-      if (![teamA,teamB].includes(giver)) return toast("ハンデ出しチームを確認してください");
-      const handicap = normalizeHandicapInput(fd.get("handicap"));
-      if (!handicap) return toast("ハンデは0.1〜4.0の0.1刻み、または1半〜3半系で入力してください");
       const game = {
         id:uid("game"),
         createdAt:Date.now(),
         date:fd.get("date"),
         league:fd.get("league"),
         teamA, teamB,
-        handicapGiver:giver,
-        handicapId:handicap,
+        externalGameId:null,
+        status:"SCHEDULED",
+        resultLocked:false,
         bets:[],
         scoreA:null, scoreB:null
       };
+      const gameKey = canonicalGameKey(game);
+      if (state.games.some(g => canonicalGameKey(g) === gameKey)) return toast("同じ試合はすでに登録されています");
       state.games.push(game);
       saveCache();
       route="today";
       render();
-      await writeCloud("PUT", `games/${game.id}`, {...game, bets:{}}, "試合を共通データへ登録しました");
+      await writeCloud("PUT", `games/${game.id}`, {...game, bets:{}}, "試合を登録しました");
     };
 
     document.querySelectorAll("[data-add-bet]").forEach(b=>b.onclick=()=>openBetModal(b.dataset.addBet));
@@ -656,7 +670,7 @@
       if(teamsFor(league).includes(team)) return toast("そのチームは登録済みです");
       state.customTeams[league].push(team);
       saveCache(); ctf.reset(); render();
-      await writeCloud("PUT", `customTeams/${league}/${uid("team")}`, {name:team}, "チームを共通データへ追加しました");
+      await writeCloud("PUT", `customTeams/${league}/${uid("team")}`, {name:team}, "チームを追加しました");
     };
 
     const exportBtn = document.getElementById("exportBtn");
@@ -675,18 +689,25 @@
   function openBetModal(gameId) {
     const game = state.games.find(g=>g.id===gameId);
     if(!game) return;
-    if(settleGame(game)) return toast("結果入力済みの試合には追加できません");
+    if(!canAcceptBet(game)) return toast("この試合は受付締切または終了済みです");
     const modal=document.getElementById("modal"), body=document.getElementById("modalBody");
     body.innerHTML=`
       <h2>賭けを追加</h2>
       <div class="muted small">${esc(game.teamA)} vs ${esc(game.teamB)}</div>
       <div style="height:12px"></div>
-      <label>客名</label>
+      <label>名前</label>
       <input name="bettor" list="bettorList" required placeholder="名前">
       <datalist id="bettorList">${state.bettors.map(x=>`<option value="${esc(x)}">`).join("")}</datalist>
       <div style="height:10px"></div>
       <label>賭けるチーム</label>
       <select name="team"><option>${esc(game.teamA)}</option><option>${esc(game.teamB)}</option></select>
+      <div style="height:10px"></div>
+      <label>ハンデを出すチーム</label>
+      <select name="giver"><option>${esc(game.teamA)}</option><option>${esc(game.teamB)}</option></select>
+      <div style="height:10px"></div>
+      <label>ハンデ</label>
+      <input name="handicap" list="handicapSuggestionsModal" inputmode="decimal" autocomplete="off" placeholder="例: 0.3 / 2.3 / 2半3" required>
+      <datalist id="handicapSuggestionsModal">${HANDICAP_SUGGESTIONS.map(h=>`<option value="${h}"></option>`).join("")}</datalist>
       <div style="height:10px"></div>
       <label>金額</label>
       <input name="amount" type="number" min="1" step="1" inputmode="numeric" placeholder="10000" required>
@@ -698,13 +719,18 @@
     document.getElementById("saveBetBtn").onclick=async ()=>{
       const bettor=String(body.elements.bettor.value||"").trim();
       const team=body.elements.team.value;
+      const giver=body.elements.giver.value;
+      const handicap=normalizeHandicapInput(body.elements.handicap.value);
       const amount=Number(body.elements.amount.value);
-      if(!bettor || !Number.isFinite(amount) || amount<=0) return toast("客名と金額を確認してください");
-      const bet={id:uid("bet"),bettor,team,amount};
+      if(!bettor || !Number.isFinite(amount) || amount<=0) return toast("名前と金額を確認してください");
+      if(![game.teamA,game.teamB].includes(team) || ![game.teamA,game.teamB].includes(giver)) return toast("チームを確認してください");
+      if(!handicap) return toast("ハンデを確認してください");
+      if(!canAcceptBet(game)) return toast("受付時間を過ぎています");
+      const bet={id:uid("bet"),createdAt:Date.now(),bettor,team,handicapGiver:giver,handicapId:handicap,amount};
       game.bets.push(bet);
       if(!state.bettors.includes(bettor)) state.bettors.push(bettor);
       saveCache();modal.close();render();
-      await writeCloud("PUT", `games/${game.id}/bets/${bet.id}`, bet, "賭けを共通データへ登録しました");
+      await writeCloud("PUT", `games/${game.id}/bets/${bet.id}`, bet, "登録しました");
     };
   }
 
@@ -718,7 +744,7 @@
         <div><label>${esc(game.teamA)}</label><input name="scoreA" type="number" min="0" step="1" inputmode="numeric" value="${game.scoreA ?? ""}" required></div>
         <div><label>${esc(game.teamB)}</label><input name="scoreB" type="number" min="0" step="1" inputmode="numeric" value="${game.scoreB ?? ""}" required></div>
       </div>
-      <div class="note" style="margin-top:12px">${esc(game.handicapGiver)} が ${esc(hcapLabel(game.handicapId))} 出し</div>
+      <div class="note" style="margin-top:12px">FINALとして確定した時だけ精算されます。</div>
       <div class="inline-actions" style="margin-top:16px">
         <button type="button" class="primary-btn" id="saveResultBtn">計算して保存</button>
         ${settleGame(game)?`<button type="button" class="secondary-btn" id="clearResultBtn">結果を未入力へ戻す</button>`:""}
@@ -728,13 +754,13 @@
     document.getElementById("saveResultBtn").onclick=async ()=>{
       const a=Number(body.elements.scoreA.value), b=Number(body.elements.scoreB.value);
       if(!Number.isInteger(a)||!Number.isInteger(b)||a<0||b<0) return toast("得点を確認してください");
-      game.scoreA=a;game.scoreB=b;saveCache();modal.close();render();
-      await writeCloud("PATCH", `games/${game.id}`, {scoreA:a,scoreB:b}, "結果と精算を共通保存しました");
+      game.scoreA=a;game.scoreB=b;game.status="FINAL";game.resultLocked=true;saveCache();modal.close();render();
+      await writeCloud("PATCH", `games/${game.id}`, {scoreA:a,scoreB:b,status:"FINAL",resultLocked:true}, "結果を確定しました");
     };
     const clear=document.getElementById("clearResultBtn");
     if(clear) clear.onclick=async ()=>{
-      game.scoreA=null;game.scoreB=null;saveCache();modal.close();render();
-      await writeCloud("PATCH", `games/${game.id}`, {scoreA:null,scoreB:null}, "結果を未入力に戻しました");
+      game.scoreA=null;game.scoreB=null;game.status="SCHEDULED";game.resultLocked=false;saveCache();modal.close();render();
+      await writeCloud("PATCH", `games/${game.id}`, {scoreA:null,scoreB:null,status:"SCHEDULED",resultLocked:false}, "結果を未確定に戻しました");
     };
   }
 
